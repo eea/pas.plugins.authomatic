@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.2.1 (unreleased)
+## 1.2.1.dev1 (2024-03-14)
 
 
 - Search users by fullname and email. @alecghica
