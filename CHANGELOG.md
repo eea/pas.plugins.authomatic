@@ -1,11 +1,14 @@
 # Changelog
 
-## 1.2.1.dev1 (2024-03-14)
 
-
-- Search users by fullname and email. @alecghica
+## 1.2.1.dev2 (2024-06-03)
 
 - Fix login on Volto frontend when already logged-in in Plone Classic. @avoinea
+
+
+## 1.2.1.dev1 (2024-03-14)
+
+- Search users by fullname and email. @alecghica
 
 
 ## 1.2.0 (2023-09-13)
