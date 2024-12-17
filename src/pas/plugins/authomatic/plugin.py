@@ -1,3 +1,4 @@
+import requests
 from AccessControl import ClassSecurityInfo
 from AccessControl.class_init import InitializeClass
 from BTrees.OOBTree import OOBTree
@@ -20,6 +21,7 @@ from zope.interface import implementer
 
 import logging
 
+from pas.plugins.authomatic.utils import authomatic_cfg
 
 logger = logging.getLogger(__name__)
 tpl_dir = Path(__file__).parent.resolve() / "browser"
@@ -183,6 +185,48 @@ class AuthomaticPlugin(BasePlugin):
     # ##
     # pas_interfaces.plugins.IUserEnumaration
 
+
+    @security.private
+    def _getMSAccessToken(self):
+        settings = authomatic_cfg()
+        cfg = settings.get("microsoft")
+
+        url = f"https://login.microsoftonline.com/{cfg["domain"]}/oauth2/v2.0/token"
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+
+        data = {
+
+            "grant_type": "client_credentials",
+            "client_id": cfg["consumer_key"],
+            "client_secret": cfg["consumer_secret"],
+            "scope": "https://graph.microsoft.com/.default"
+        }
+
+        #TODO: maybe do this with authomatic somehow? (perhaps extend the default plugin?)
+        response = requests.post(url, headers=headers, data=data)
+        token_data = response.json()
+
+        #TODO: cache this and refresh when necessary
+        return token_data["access_token"]
+
+    @security.private
+    def queryMSApiUsers(self, _login=""):
+        pluginid = self.getId()
+        token = self._getMSAccessToken()
+
+        url = "https://graph.microsoft.com/v1.0/users"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+        response = requests.get(url, headers=headers)
+
+        if response.status_code == 200:
+            users = response.json()
+            return [{"login": user["displayName"], "id": f'MS-{user["id"]}'} for user in users["value"]]
+
+        return [
+            {"id": "api-user-mock", "login": "mockuser", "pluginid": pluginid}
+        ]
+
     @security.private
     def enumerateUsers(
         self,
@@ -243,6 +287,7 @@ class AuthomaticPlugin(BasePlugin):
 
         pluginid = self.getId()
         ret = list()
+        # ret.extend(self.queryMSApiUsers(search_id))
         # shortcut for exact match of login/id
         identity = None
         if exact_match and search_id and search_id in self._useridentities_by_userid:
