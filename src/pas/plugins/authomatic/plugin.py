@@ -1,3 +1,5 @@
+from time import time
+import authomatic.core
 import requests
 from AccessControl import ClassSecurityInfo
 from AccessControl.class_init import InitializeClass
@@ -18,10 +20,18 @@ from Products.PluggableAuthService.plugins.BasePlugin import BasePlugin
 from Products.PluggableAuthService.utils import createViewName
 from zope.event import notify
 from zope.interface import implementer
+from plone.memoize import ram
 
 import logging
 
 from pas.plugins.authomatic.utils import authomatic_cfg
+
+logging.basicConfig(level=logging.DEBUG)
+reqlogger = logging.getLogger("urllib3")
+reqlogger.setLevel(logging.DEBUG)
+
+# calculate fibbonacci
+
 
 logger = logging.getLogger(__name__)
 tpl_dir = Path(__file__).parent.resolve() / "browser"
@@ -44,6 +54,14 @@ manage_addAuthomaticPluginForm = PageTemplateFile(
 )
 
 
+def _cachekey_ms_users(method, self, login):
+    return time() // (60 * 60), login
+
+
+def _cachekey_ms_users_inconsistent(method, self, query, properties):
+    return time() // (60 * 60), query, properties.items() if properties else None
+
+
 @implementer(
     IAuthomaticPlugin,
     pas_interfaces.IAuthenticationPlugin,
@@ -58,6 +76,8 @@ class AuthomaticPlugin(BasePlugin):
     security = ClassSecurityInfo()
     meta_type = "Authomatic Plugin"
     BasePlugin.manage_options
+
+    _ms_token = None
 
     # Tell PAS not to swallow our exceptions
     _dont_swallow_my_exceptions = True
@@ -84,7 +104,7 @@ class AuthomaticPlugin(BasePlugin):
         return (result.provider.name, result.user.id)
 
     @security.private
-    def lookup_identities(self, result):
+    def lookup_identities(self, result: authomatic.core.LoginResult):
         """looks up the UserIdentities by using the provider name and the
         userid at this provider
         """
@@ -185,47 +205,111 @@ class AuthomaticPlugin(BasePlugin):
     # ##
     # pas_interfaces.plugins.IUserEnumaration
 
-
     @security.private
     def _getMSAccessToken(self):
+        if self._ms_token and self._ms_token["expires"] > time():
+            return self._ms_token["access_token"]
+
         settings = authomatic_cfg()
         cfg = settings.get("microsoft")
 
-        url = f"https://login.microsoftonline.com/{cfg["domain"]}/oauth2/v2.0/token"
+        url = f'https://login.microsoftonline.com/{cfg["domain"]}/oauth2/v2.0/token'
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
 
         data = {
-
             "grant_type": "client_credentials",
             "client_id": cfg["consumer_key"],
             "client_secret": cfg["consumer_secret"],
-            "scope": "https://graph.microsoft.com/.default"
+            "scope": "https://graph.microsoft.com/.default",
         }
 
-        #TODO: maybe do this with authomatic somehow? (perhaps extend the default plugin?)
+        # TODO: maybe do this with authomatic somehow? (perhaps extend the default plugin?)
         response = requests.post(url, headers=headers, data=data)
         token_data = response.json()
 
-        #TODO: cache this and refresh when necessary
-        return token_data["access_token"]
+        # TODO: cache this and refresh when necessary
+        self._ms_token = {"expires": time() + token_data["expires_in"] - 60}
+        self._ms_token.update(token_data)
+        return self._ms_token["access_token"]
 
     @security.private
-    def queryMSApiUsers(self, _login=""):
+    @ram.cache(_cachekey_ms_users)
+    def queryMSApiUsers(self, login=""):
         pluginid = self.getId()
         token = self._getMSAccessToken()
 
-        url = "https://graph.microsoft.com/v1.0/users"
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        url = (
+            f"https://graph.microsoft.com/v1.0/users/{login}"
+            if login
+            else "https://graph.microsoft.com/v1.0/users"
+        )
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
 
         response = requests.get(url, headers=headers)
 
         if response.status_code == 200:
             users = response.json()
-            return [{"login": user["displayName"], "id": f'MS-{user["id"]}'} for user in users["value"]]
+            users = users.get("value", [users])
+            return [
+                {"login": user["displayName"], "id": user["id"], "pluginid": pluginid}
+                for user in users
+            ]
 
-        return [
-            {"id": "api-user-mock", "login": "mockuser", "pluginid": pluginid}
-        ]
+        return []
+
+    @security.private
+    @ram.cache(_cachekey_ms_users_inconsistent)
+    def queryMSApiUsersInconsistently(self, query="", properties=None):
+        pluginid = self.getId()
+        token = self._getMSAccessToken()
+
+        customQuery = ""
+
+        if not properties and query:
+            customQuery = f"displayName:{query}"
+
+        if properties and properties.get("fullname"):
+            customQuery = f"displayName:{properties.get('fullname')}"
+
+        elif properties and properties.get("email"):
+            customQuery = f"mail:{properties.get('email')}"
+
+        if customQuery:
+            url = f'https://graph.microsoft.com/v1.0/users?$search="{customQuery}"'
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "ConsistencyLevel": "eventual",
+            }
+
+            response = requests.get(url, headers=headers)
+
+            if response.status_code == 200:
+                users = response.json()
+                users = users.get("value", [users])
+                return [
+                    {
+                        "login": user["displayName"],
+                        "id": user["id"],
+                        "pluginid": pluginid,
+                    }
+                    for user in users
+                ]
+
+        return []
+
+    @security.private
+    # @ram.cache(_cachekey_ms_users)
+    def queryMSApiUsersEndpoint(self, login="", exact=False, **properties):
+        if exact:
+            return self.queryMSApiUsers(login)
+        else:
+            return self.queryMSApiUsersInconsistently(login, properties)
 
     @security.private
     def enumerateUsers(
@@ -280,14 +364,29 @@ class AuthomaticPlugin(BasePlugin):
         if id and login and id != login:
             raise ValueError("plugin does not support id different from login")
         search_id = id or login
+        from pprint import pprint
+
+        pprint(
+            {
+                "search_id": search_id,
+                "kwargs": kw,
+                "exact_match": exact_match,
+                "sort_by": sort_by,
+                "max_results": max_results,
+            }
+        )
+        ret = list()
+        ret.extend(self.queryMSApiUsersEndpoint(search_id, exact_match, **kw))
+        # if not search_id and not kw:
+        #     api_users = self.queryMSApiUsers()
+        #     pprint(api_users)
+        #     return api_users
         if not search_id:
-            return ()
+            return ret
         if not isinstance(search_id, str):
             raise NotImplementedError("sequence is not supported.")
 
         pluginid = self.getId()
-        ret = list()
-        # ret.extend(self.queryMSApiUsers(search_id))
         # shortcut for exact match of login/id
         identity = None
         if exact_match and search_id and search_id in self._useridentities_by_userid:
