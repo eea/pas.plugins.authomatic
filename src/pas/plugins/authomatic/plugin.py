@@ -1,6 +1,3 @@
-from time import time
-import authomatic.core
-import requests
 from AccessControl import ClassSecurityInfo
 from AccessControl.class_init import InitializeClass
 from BTrees.OOBTree import OOBTree
@@ -8,23 +5,29 @@ from operator import itemgetter
 from pas.plugins.authomatic.interfaces import IAuthomaticPlugin
 from pas.plugins.authomatic.useridentities import UserIdentities
 from pas.plugins.authomatic.useridfactories import new_userid
+from pas.plugins.authomatic.utils import authomatic_cfg
 from pathlib import Path
 from plone import api
+from plone.memoize import ram
 from Products.PageTemplates.PageTemplateFile import PageTemplateFile
 from Products.PlonePAS.interfaces.capabilities import IDeleteCapability
+from Products.PlonePAS.interfaces.group import IGroupIntrospection
+from Products.PlonePAS.interfaces.group import IGroupManagement
 from Products.PlonePAS.interfaces.plugins import IUserManagement
+from Products.PlonePAS.plugins.autogroup import VirtualGroup
 from Products.PluggableAuthService.events import PrincipalCreated
 from Products.PluggableAuthService.interfaces import plugins as pas_interfaces
 from Products.PluggableAuthService.interfaces.authservice import _noroles
 from Products.PluggableAuthService.plugins.BasePlugin import BasePlugin
 from Products.PluggableAuthService.utils import createViewName
+from time import time
 from zope.event import notify
 from zope.interface import implementer
-from plone.memoize import ram
 
+import authomatic.core
 import logging
+import requests
 
-from pas.plugins.authomatic.utils import authomatic_cfg
 
 logging.basicConfig(level=logging.DEBUG)
 reqlogger = logging.getLogger("urllib3")
@@ -62,11 +65,27 @@ def _cachekey_ms_users_inconsistent(method, self, query, properties):
     return time() // (60 * 60), query, properties.items() if properties else None
 
 
+def _cachekey_ms_groups(method, self, group_id):
+    return time() // (60 * 60), group_id
+
+
+def _cachekey_ms_groups_inconsistent(method, self, query, properties):
+    return time() // (60 * 60), query, properties.items() if properties else None
+
+
+def _cachekey_ms_groups_for_principal(method, self, principal, *args, **kwargs):
+    return time() // (60 * 60), principal.getId()
+
+
 @implementer(
     IAuthomaticPlugin,
     pas_interfaces.IAuthenticationPlugin,
     pas_interfaces.IPropertiesPlugin,
     pas_interfaces.IUserEnumerationPlugin,
+    pas_interfaces.IGroupEnumerationPlugin,
+    pas_interfaces.IGroupsPlugin,
+    IGroupManagement,
+    IGroupIntrospection,
     IUserManagement,
     IDeleteCapability,
 )
@@ -212,25 +231,27 @@ class AuthomaticPlugin(BasePlugin):
 
         settings = authomatic_cfg()
         cfg = settings.get("microsoft")
+        domain = cfg.get("domain")
 
-        url = f'https://login.microsoftonline.com/{cfg["domain"]}/oauth2/v2.0/token'
-        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        if domain:
+            url = f"https://login.microsoftonline.com/{domain}/oauth2/v2.0/token"
+            headers = {"Content-Type": "application/x-www-form-urlencoded"}
 
-        data = {
-            "grant_type": "client_credentials",
-            "client_id": cfg["consumer_key"],
-            "client_secret": cfg["consumer_secret"],
-            "scope": "https://graph.microsoft.com/.default",
-        }
+            data = {
+                "grant_type": "client_credentials",
+                "client_id": cfg["consumer_key"],
+                "client_secret": cfg["consumer_secret"],
+                "scope": "https://graph.microsoft.com/.default",
+            }
 
-        # TODO: maybe do this with authomatic somehow? (perhaps extend the default plugin?)
-        response = requests.post(url, headers=headers, data=data)
-        token_data = response.json()
+            # TODO: maybe do this with authomatic somehow? (perhaps extend the default plugin?)
+            response = requests.post(url, headers=headers, data=data)
+            token_data = response.json()
 
-        # TODO: cache this and refresh when necessary
-        self._ms_token = {"expires": time() + token_data["expires_in"] - 60}
-        self._ms_token.update(token_data)
-        return self._ms_token["access_token"]
+            # TODO: cache this and refresh when necessary
+            self._ms_token = {"expires": time() + token_data["expires_in"] - 60}
+            self._ms_token.update(token_data)
+            return self._ms_token["access_token"]
 
     @security.private
     @ram.cache(_cachekey_ms_users)
@@ -304,7 +325,6 @@ class AuthomaticPlugin(BasePlugin):
         return []
 
     @security.private
-    # @ram.cache(_cachekey_ms_users)
     def queryMSApiUsersEndpoint(self, login="", exact=False, **properties):
         if exact:
             return self.queryMSApiUsers(login)
@@ -364,23 +384,19 @@ class AuthomaticPlugin(BasePlugin):
         if id and login and id != login:
             raise ValueError("plugin does not support id different from login")
         search_id = id or login
-        from pprint import pprint
-
-        pprint(
-            {
-                "search_id": search_id,
-                "kwargs": kw,
-                "exact_match": exact_match,
-                "sort_by": sort_by,
-                "max_results": max_results,
-            }
-        )
+        # from pprint import pprint
+        #
+        # pprint(
+        #     {
+        #         "search_id": search_id,
+        #         "kwargs": kw,
+        #         "exact_match": exact_match,
+        #         "sort_by": sort_by,
+        #         "max_results": max_results,
+        #     }
+        # )
         ret = list()
         ret.extend(self.queryMSApiUsersEndpoint(search_id, exact_match, **kw))
-        # if not search_id and not kw:
-        #     api_users = self.queryMSApiUsers()
-        #     pprint(api_users)
-        #     return api_users
         if not search_id:
             return ret
         if not isinstance(search_id, str):
@@ -438,6 +454,203 @@ class AuthomaticPlugin(BasePlugin):
         if sort_by in ["id", "login"]:
             return sorted(ret, key=itemgetter(sort_by))
         return ret
+
+    @security.private
+    def addGroup(self, *args, **kw):
+        """noop"""
+        pass
+
+    @security.private
+    def addPrincipalToGroup(self, *args, **kwargs):
+        """noop"""
+        pass
+
+    @security.private
+    def removeGroup(self, *args, **kwargs):
+        """noop"""
+        pass
+
+    @security.private
+    def removePrincipalFromGroup(self, *args, **kwargs):
+        """noop"""
+        pass
+
+    @security.private
+    def updateGroup(self, *args, **kw):
+        """noop"""
+        pass
+
+    @security.private
+    def setRolesForGroup(self, group_id, roles=()):
+        rmanagers = self._getPlugins().listPlugins(pas_interfaces.IRoleAssignerPlugin)
+        if not (rmanagers):
+            raise NotImplementedError(
+                "There is no plugin that can assign roles to groups"
+            )
+        for rid, rmanager in rmanagers:
+            rmanager.assignRolesToPrincipal(roles, group_id)
+
+    @security.private
+    def getGroupById(self, group_id):
+        groups = self.queryMSApiGroups(group_id)
+        group = groups[0] if len(groups) == 1 else None
+        if group:
+            return VirtualGroup(
+                group["id"],
+                title=group["title"],
+                description=group["title"],
+            )
+
+    @security.private
+    def getGroupIds(self):
+        return [group["id"] for group in self.queryMSApiGroups("")]
+
+    @security.private
+    @ram.cache(_cachekey_ms_groups_for_principal)
+    def getGroupsForPrincipal(self, principal, *args, **kwargs):
+        token = self._getMSAccessToken()
+
+        url = f"https://graph.microsoft.com/v1.0/users/{principal.getId()}/memberOf/microsoft.graph.group"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+
+        response = requests.get(url, headers=headers)
+
+        if response.status_code == 200:
+            groups = response.json()
+            groups = groups.get("value", [])
+            return [group["id"] for group in groups]
+
+        return []
+
+    @security.private
+    def getGroupMembers(self, group_id):
+        token = self._getMSAccessToken()
+
+        url = f"https://graph.microsoft.com/v1.0/groups/{group_id}/members"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+
+        response = requests.get(url, headers=headers)
+
+        if response.status_code == 200:
+            users = response.json()
+            users = users.get("value", [])
+            return [user["id"] for user in users]
+
+        return []
+
+    @security.private
+    @ram.cache(_cachekey_ms_groups)
+    def queryMSApiGroups(self, group_id=""):
+        pluginid = self.getId()
+        token = self._getMSAccessToken()
+
+        url = (
+            f"https://graph.microsoft.com/v1.0/groups/{group_id}"
+            if group_id
+            else "https://graph.microsoft.com/v1.0/groups"
+        )
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+
+        response = requests.get(url, headers=headers)
+
+        if response.status_code == 200:
+            groups = response.json()
+            groups = groups.get("value", [groups])
+            return [
+                {
+                    "title": group["displayName"],
+                    "id": group["id"],
+                    "groupid": group["id"],
+                    "pluginid": pluginid,
+                }
+                for group in groups
+            ]
+
+        return []
+
+    @security.private
+    @ram.cache(_cachekey_ms_groups_inconsistent)
+    def queryMSApiGroupsInconsistently(self, query="", properties=None):
+        pluginid = self.getId()
+        token = self._getMSAccessToken()
+
+        customQuery = ""
+
+        if not properties and query:
+            customQuery = f"displayName:{query}"
+
+        if properties and properties.get("title"):
+            customQuery = f"displayName:{properties.get('title')}"
+
+        if customQuery:
+            url = f'https://graph.microsoft.com/v1.0/groups?$search="{customQuery}"'
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "ConsistencyLevel": "eventual",
+            }
+
+            response = requests.get(url, headers=headers)
+
+            if response.status_code == 200:
+                groups = response.json()
+                groups = groups.get("value", [groups])
+                return [
+                    {
+                        "title": group["displayName"],
+                        "id": group["id"],
+                        "groupid": group["id"],
+                        "pluginid": pluginid,
+                    }
+                    for group in groups
+                ]
+
+        return []
+
+    @security.private
+    def queryMSApiGroupsEndpoint(self, query="", exact=False, **properties):
+        if exact or not query:
+            return self.queryMSApiGroups(query)
+        else:
+            return self.queryMSApiGroupsInconsistently(query, properties)
+
+    @security.private
+    def enumerateGroups(
+        self, id=None, exact_match=False, sort_by=None, max_results=None, **kw
+    ):
+        from pprint import pprint
+
+        pprint(
+            {
+                "id": id,
+                "exact_match": exact_match,
+                "kw": kw,
+                "sort_by": sort_by,
+                "max_results": max_results,
+            }
+        )
+        return self.queryMSApiGroupsEndpoint(id, exact_match, **kw)
+        # return [
+        #     {
+        #         "id": "mock-group-id",
+        #         "groupid": "mock-group-id",
+        #         "title": "Mock Group",
+        #         "pluginid": self.getId(),
+        #     }
+        # ]
 
     @security.public
     def allowDeletePrincipal(self, principal_id):
