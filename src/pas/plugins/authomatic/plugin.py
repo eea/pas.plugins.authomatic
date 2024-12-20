@@ -82,10 +82,10 @@ def _cachekey_ms_groups_for_principal(method, self, principal, *args, **kwargs):
     pas_interfaces.IAuthenticationPlugin,
     pas_interfaces.IPropertiesPlugin,
     pas_interfaces.IUserEnumerationPlugin,
-    pas_interfaces.IGroupEnumerationPlugin,
-    pas_interfaces.IGroupsPlugin,
-    IGroupManagement,
-    IGroupIntrospection,
+    # pas_interfaces.IGroupEnumerationPlugin,
+    # pas_interfaces.IGroupsPlugin,
+    # IGroupManagement,
+    # IGroupIntrospection,
     IUserManagement,
     IDeleteCapability,
 )
@@ -396,7 +396,7 @@ class AuthomaticPlugin(BasePlugin):
         #     }
         # )
         ret = list()
-        ret.extend(self.queryMSApiUsersEndpoint(search_id, exact_match, **kw))
+        # ret.extend(self.queryMSApiUsersEndpoint(search_id, exact_match, **kw))
         if not search_id:
             return ret
         if not isinstance(search_id, str):
